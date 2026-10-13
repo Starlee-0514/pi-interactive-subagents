@@ -1,6 +1,29 @@
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
+
+import { parsePhaseContract, type PhaseContract } from './phase-contract.ts';
+
+export interface ManagedPhaseSnapshot { contract: PhaseContract; body: string; agentDir: string; lazyModule: string; piExecutable: string; }
+export function writeManagedPhaseSnapshot(sessionFile: string, snapshot: ManagedPhaseSnapshot): void {
+  const lines = readFileSync(sessionFile, 'utf8').split('\n');
+  const header = JSON.parse(lines[0]);
+  header.managedPhaseWorker = true;
+  header.phaseParentSession = snapshot.contract.parentSessionId;
+  lines[0] = JSON.stringify(header);
+  writeFileSync(sessionFile, lines.join('\n'), { mode: 0o600 });
+  writeFileSync(`${sessionFile}.loadout.json`, JSON.stringify(snapshot), { mode: 0o600 });
+}
+export function readManagedPhaseSnapshot(sessionFile: string): ManagedPhaseSnapshot | undefined {
+  const header = JSON.parse(readFileSync(sessionFile, 'utf8').split('\n')[0]);
+  const path = `${sessionFile}.loadout.json`;
+  if (!header.managedPhaseWorker && !existsSync(path)) return;
+  if (!existsSync(path)) throw new Error('Managed phase resume missing loadout snapshot; refusing unrestricted resume');
+  const snapshot = JSON.parse(readFileSync(path, 'utf8'));
+  const contract = parsePhaseContract(JSON.stringify(snapshot.contract));
+  if (!header.managedPhaseWorker || header.phaseParentSession !== contract.parentSessionId || typeof snapshot.body !== 'string' || typeof snapshot.agentDir !== 'string' || typeof snapshot.lazyModule !== 'string' || typeof snapshot.piExecutable !== 'string' || !snapshot.piExecutable.startsWith('/')) throw new Error('Invalid managed phase snapshot');
+  return { ...snapshot, contract };
+}
 
 export interface SessionEntry {
   type: string;

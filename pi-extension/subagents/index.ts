@@ -14,6 +14,7 @@ import {
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
+import { execFileSync } from 'node:child_process';
 import {
   isMuxAvailable,
   muxSetupHint,
@@ -33,7 +34,11 @@ import {
   findLastAssistantMessage,
   getNewEntries,
   seedSubagentSessionFile,
+  writeManagedPhaseSnapshot,
+  readManagedPhaseSnapshot,
 } from "./session.ts";
+import { parsePhaseContract, managedPhaseProfile, managedPhaseCliArgs, managedPhaseEnv, validatePhaseOverrides, type PhaseContract } from './phase-contract.ts';
+import { registerPhaseDelegation, PHASE_OUTCOME_EVENT } from './phase-delegation.ts';
 import {
   type StatusSnapshot,
   type SubagentStatusState,
@@ -487,6 +492,7 @@ interface SubagentResult {
  * State for a launched (but not yet completed) subagent.
  */
 interface RunningSubagent {
+  phaseContract?: PhaseContract;
   id: string;
   name: string;
   task: string;
@@ -913,6 +919,7 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
+  launchSubagent,
 };
 
 function startWidgetRefresh() {
@@ -932,13 +939,22 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string; model?: { provider: string; id: string } },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
-  const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
+  const phaseContract = params.agent === 'phase-worker' ? parsePhaseContract(params.task) : undefined;
+  if (phaseContract) {
+    validatePhaseOverrides(params, phaseContract);
+    if (phaseContract.parentSessionId !== ctx.sessionManager.getSessionId() || phaseContract.provider !== ctx.model?.provider || phaseContract.modelId !== ctx.model?.id) throw new Error('Phase contract parent/model mismatch');
+    if (Array.from(runningSubagents.values()).some(r => r.phaseContract)) throw new Error('One writable phase-worker at a time');
+    if (getMuxBackend() !== 'zellij') throw new Error('Managed phase pilot currently requires Zellij');
+  }
+  const agentDefs = phaseContract
+    ? { ...managedPhaseProfile(phaseContract), body: readFileSync(join(getBundledAgentsDir(), 'phase-worker.md'), 'utf8').replace(/^---\n[\s\S]*?\n---\n*/, '') }
+    : params.agent ? loadAgentDefaults(params.agent) : null;
   const effectiveModel = params.model ?? agentDefs?.model;
   const effectiveTools = params.tools ?? agentDefs?.tools;
   const effectiveSkills = params.skills ?? agentDefs?.skills;
@@ -950,7 +966,9 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, localAgentDir, effectiveAgentDir } = phaseContract
+    ? { effectiveCwd: phaseContract.cwd, localAgentDir: undefined, effectiveAgentDir: getAgentConfigDir() }
+    : resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -969,8 +987,8 @@ async function launchSubagent(
   // Use pre-created surface (parallel mode) or create a new one.
   // For new surfaces, pause briefly so the shell is ready before sending the command.
   const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
+  let surface = phaseContract ? '' : options?.surface ?? createSurface(params.name);
+  if (!phaseContract && !surfacePreCreated) {
     await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
   }
 
@@ -985,6 +1003,15 @@ async function launchSubagent(
     });
   }
 
+  const phasePiExecutable = phaseContract ? execFileSync('bash', ['-c', 'command -v pi'], { encoding: 'utf8', timeout: 5000 }).trim() : undefined;
+  if (phasePiExecutable && !phasePiExecutable.startsWith('/')) throw new Error('Managed phase requires an absolute Pi executable');
+  const phaseContractPath = `${subagentSessionFile}.phase.json`;
+  const phaseLazyModule = join(getAgentConfigDir(), 'local-packages', 'rpiv-ask-user-question', 'lazy-mode.ts');
+  if (phaseContract) {
+    if (!existsSync(phaseLazyModule)) throw new Error('Required lazy owner module not found');
+    writeFileSync(phaseContractPath, JSON.stringify(phaseContract), { mode: 0o600 });
+    writeManagedPhaseSnapshot(subagentSessionFile, { contract: phaseContract, body: agentDefs!.body!, agentDir: getAgentConfigDir(), lazyModule: phaseLazyModule, piExecutable: phasePiExecutable! });
+  }
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
@@ -1007,7 +1034,7 @@ async function launchSubagent(
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
   // ── Claude Code CLI path ──
-  if (agentDefs?.cli === "claude") {
+  if (!phaseContract && agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
 
@@ -1082,13 +1109,17 @@ async function launchSubagent(
   // ── Pi CLI path ──
 
   // Build pi command
-  const parts: string[] = ["pi"];
+  const parts: string[] = [phasePiExecutable ? shellEscape(phasePiExecutable) : 'pi'];
   parts.push("--session", shellEscape(subagentSessionFile));
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-  parts.push("-e", shellEscape(subagentDonePath));
+  if (phaseContract) {
+    parts.push(...managedPhaseCliArgs(phaseContract, subagentDonePath, join(SUBAGENTS_DIR, 'phase-worker-context.ts'), phaseContractPath).map(shellEscape));
+  } else {
+    parts.push('-e', shellEscape(subagentDonePath));
+  }
 
-  if (effectiveModel) {
+  if (!phaseContract && effectiveModel) {
     const model = effectiveThinking ? `${effectiveModel}:${effectiveThinking}` : effectiveModel;
     parts.push("--model", shellEscape(model));
   }
@@ -1112,12 +1143,17 @@ async function launchSubagent(
   }
 
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools);
-  if (toolAllowlist) {
+  if (!phaseContract && toolAllowlist) {
     parts.push("--tools", shellEscape(toolAllowlist));
   }
 
   // Build env prefix: denied tools + subagent identity + config dir propagation
   const envParts: string[] = [];
+  if (phaseContract) {
+    envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(getAgentConfigDir())}`);
+    envParts.push(`PI_PHASE_LAZY_MODULE=${shellEscape(phaseLazyModule)}`);
+    for (const [key, value] of Object.entries(managedPhaseEnv(phaseContract, phaseContractPath))) envParts.push(`${key}=${shellEscape(value)}`);
+  }
 
   // If the target cwd has its own .pi/agent/, use that as the config root.
   // Otherwise propagate the current/global agent dir.
@@ -1187,6 +1223,7 @@ async function launchSubagent(
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
+    writeOnly: !!phaseContract,
     scriptPath: launchScriptFile,
     scriptPreamble: [
       `# Subagent launch script for ${params.name}`,
@@ -1196,7 +1233,9 @@ async function launchSubagent(
     ].join("\n"),
   });
 
+  if (phaseContract) surface = createSurface(params.name, { command: ['bash', launchScriptFile], dedicatedTab: true, cwd: phaseContract.cwd });
   const running: RunningSubagent = {
+    phaseContract,
     id,
     name: params.name,
     task: params.task,
@@ -1357,7 +1396,12 @@ async function watchSubagent(
   }
 }
 
+function emitPhaseOutcome(pi: ExtensionAPI, running: RunningSubagent, result: SubagentResult) {
+  if (running.phaseContract) pi.events.emit(PHASE_OUTCOME_EVENT, { contract: running.phaseContract, runId: running.id, sessionFile: running.sessionFile, kind: result.ping ? 'help' : 'result', exitCode: result.exitCode, summary: result.ping?.message ?? result.summary });
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
+  if (pi.events?.on) registerPhaseDelegation(pi, () => Array.from(runningSubagents.values()));
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
@@ -1462,6 +1506,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
+            emitPhaseOutcome(pi, running, result);
 
             if (result.ping) {
               // Subagent is requesting help — steer a ping message with session path for resume
@@ -1790,18 +1835,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
+        const phaseSnapshot = readManagedPhaseSnapshot(params.sessionPath);
+        if (phaseSnapshot) {
+          if (phaseSnapshot.contract.parentSessionId !== ctx.sessionManager.getSessionId() || params.autoExit === false) throw new Error('Managed phase resume parent/autoExit mismatch');
+          if (getMuxBackend() !== 'zellij') throw new Error('Managed phase pilot requires Zellij');
+          if (Array.from(runningSubagents.values()).some(r => r.phaseContract)) throw new Error('One writable phase-worker at a time');
+          if (!existsSync(phaseSnapshot.lazyModule)) throw new Error('Original lazy owner module missing');
+          writeFileSync(`${params.sessionPath}.phase.json`, JSON.stringify(phaseSnapshot.contract), { mode: 0o600 });
+          // Only the owned transient completion marker is removed, never session history or source edits.
+          if (existsSync(`${params.sessionPath}.exit`)) unlinkSync(`${params.sessionPath}.exit`);
+        }
+
         // Record entry count before resuming so we can extract new messages
         const entryCountBefore = getNewEntries(params.sessionPath, 0).length;
 
-        const surface = createSurface(name);
-        await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
+        let surface = phaseSnapshot ? '' : createSurface(name);
+        if (!phaseSnapshot) await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
         // Build pi resume command
-        const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+        const parts = [phaseSnapshot ? shellEscape(phaseSnapshot.piExecutable) : 'pi', '--session', shellEscape(params.sessionPath)];
 
         // Load subagent-done extension so the agent can self-terminate if needed
-        const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
-        parts.push("-e", shellEscape(subagentDonePath));
+        const subagentDonePath = join(SUBAGENTS_DIR, 'subagent-done.ts');
+        if (phaseSnapshot) {
+          parts.push(...managedPhaseCliArgs(phaseSnapshot.contract, subagentDonePath, join(SUBAGENTS_DIR, 'phase-worker-context.ts'), `${params.sessionPath}.phase.json`).map(shellEscape));
+          const identityPath = `${params.sessionPath}.identity.md`;
+          writeFileSync(identityPath, phaseSnapshot.body, { mode: 0o600 });
+          parts.push('--append-system-prompt', shellEscape(identityPath));
+        } else parts.push('-e', shellEscape(subagentDonePath));
 
         const sessionId = ctx.sessionManager.getSessionId();
         const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
@@ -1828,7 +1889,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
-        if (process.env.PI_CODING_AGENT_DIR) {
+        if (phaseSnapshot) {
+          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(phaseSnapshot.agentDir)}`);
+          resumeEnvParts.push(`PI_PHASE_LAZY_MODULE=${shellEscape(phaseSnapshot.lazyModule)}`);
+          for (const [key, value] of Object.entries(managedPhaseEnv(phaseSnapshot.contract, `${params.sessionPath}.phase.json`))) resumeEnvParts.push(`${key}=${shellEscape(value)}`);
+        }
+        if (!phaseSnapshot && process.env.PI_CODING_AGENT_DIR) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
@@ -1840,7 +1906,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
-        const command = `${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const resumeCd = phaseSnapshot ? `cd ${shellEscape(phaseSnapshot.contract.cwd)} && ` : '';
+        const command = `${resumeCd}${resumeEnvPrefix}${parts.join(' ')}; echo '__SUBAGENT_DONE_'$?'__'`;
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
@@ -1852,6 +1919,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
         sendLongCommand(surface, command, {
+          writeOnly: !!phaseSnapshot,
           scriptPath: launchScriptFile,
           scriptPreamble: [
             `# Subagent resume script for ${name}`,
@@ -1862,8 +1930,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           ].join("\n"),
         });
 
+        if (phaseSnapshot) surface = createSurface(name, { command: ['bash', launchScriptFile], dedicatedTab: true, cwd: phaseSnapshot.contract.cwd });
         // Register as a running subagent for widget tracking
         const running: RunningSubagent = {
+          phaseContract: phaseSnapshot?.contract,
+          agent: phaseSnapshot ? 'phase-worker' : undefined,
           id,
           name,
           task: params.message ?? "resumed session",
@@ -1889,6 +1960,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
             updateWidget();
+            emitPhaseOutcome(pi, running, result);
 
             if (result.ping) {
               const sessionRef = `\n\nSession: ${params.sessionPath}\nResume: pi --session ${params.sessionPath}`;
@@ -1956,6 +2028,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             id,
             name,
             sessionPath: params.sessionPath,
+            sessionFile: params.sessionPath,
+            agent: phaseSnapshot ? 'phase-worker' : undefined,
             launchScriptFile,
             status: "started",
           },
