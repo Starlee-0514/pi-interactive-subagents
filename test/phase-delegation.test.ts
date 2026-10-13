@@ -187,3 +187,23 @@ test('a finished goal says so: nothing to release, only a new approval is possib
  assert.match(released.details.note, /nothing to release/i);
  await assert.rejects(() => f.run({ action:'answer', message:'x' }), /allowed next actions: approve/i);
 });
+
+test('approve accepts a goal JSON file inside the session directory and rejects other paths', async () => {
+ const dir = mkdtempSync(join(tmpdir(), 'goal-')); const other = mkdtempSync(join(tmpdir(), 'goal-other-'));
+ const goal = { id:'g', scope:'implementation-and-verification', objective:'feature', phases:[{ id:'p1', objective:'parser', cwd:'/repo', allowedPaths:['src/'], acceptance:['ok'], verifyCommands:['node --test'], nonGoals:[] }] };
+ writeFileSync(join(dir, 'goal.json'), JSON.stringify(goal)); writeFileSync(join(other, 'goal.json'), JSON.stringify(goal)); writeFileSync(join(dir, 'bad.json'), '{not json');
+ const f = fixture(); f.ctx.cwd = dir;
+ const approved = await f.run({ action:'approve', approvalReference:'user-approval', goal: join(dir, 'goal.json') });
+ assert.equal(approved.details.state.goal.id, 'g');
+ for (const g of [join(other, 'goal.json'), join(dir, '..', 'x.json'), join(dir, 'missing.json'), join(dir, 'bad.json'), 'goal.json']) {
+  const g2 = fixture(); g2.ctx.cwd = dir;
+  await assert.rejects(() => g2.run({ action:'approve', approvalReference:'user-approval', goal: g }), /goal/i, g);
+ }
+ const noCwd = fixture();
+ await assert.rejects(() => noCwd.run({ action:'approve', approvalReference:'user-approval', goal: join(dir, 'goal.json') }), /session directory/i);
+});
+
+test('a malformed phase names the phase and the field to fix', async () => {
+ const f = fixture(); const bad: any = { id:'goal', scope:'implementation-and-verification', objective:'x', phases:[{ id:'p1', objective:'parser', cwd:'/repo', allowedPaths:['src/'], acceptance:['a'], verifyCommands:['v'] }] };
+ await assert.rejects(() => f.run({ action:'approve', approvalReference:'user-approval', goal: bad }), /phase "p1".*nonGoals.*array of strings/i);
+});

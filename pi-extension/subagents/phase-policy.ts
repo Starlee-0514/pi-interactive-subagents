@@ -10,7 +10,11 @@ export interface PhaseState {
 export function approveGoal(goal: PhaseGoal, authorizationReference: string): PhaseState {
  if (!goal || goal.scope !== 'implementation-and-verification' || !goal.id?.trim() || !goal.objective?.trim() || !authorizationReference?.trim() || !Array.isArray(goal.phases) || !goal.phases.length) throw new Error('Explicit implementation-and-verification goal approval required');
  const ids = new Set<string>();
- for (const p of goal.phases) { validatePhaseSpec(p); if (!p.id?.trim() || ids.has(p.id)) throw new Error('Unique phase IDs required'); ids.add(p.id); }
+ for (const p of goal.phases) {
+  if (!p?.id?.trim() || ids.has(p.id)) throw new Error('Unique phase IDs required');
+  ids.add(p.id);
+  try { validatePhaseSpec(p); } catch (error: any) { throw new Error(`phase "${p.id}": ${error.message}`); }
+ }
  return { goal, authorizationReference, next: 0, repairs: 0, status: 'ready', usedAttempts: [] };
 }
 export function preparePhase(state: PhaseState, model: { provider: string; id: string }, thinking: string, parentSessionId: string, attemptId: string, lazy: boolean|undefined, now = Date.now()): PhaseContract {

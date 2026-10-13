@@ -1,7 +1,8 @@
 import type { ExtensionAPI } from '@mariozechner/pi-coding-agent';
 import { Type } from '@sinclair/typebox';
 import { randomUUID } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { isAbsolute, relative, resolve } from 'node:path';
 import { readManagedPhaseSnapshot } from './session.ts';
 import { parsePhaseContract } from './phase-contract.ts';
 import { approveGoal, preparePhase, reviewPhase, checkpointPhase, applyPhaseOutcome, phaseMatches, canParentDecide, allowedNextActions, type PhaseState } from './phase-policy.ts';
@@ -26,6 +27,18 @@ export function latestHumanReference(ctx: any): string | undefined {
   const branch = ctx.sessionManager.getBranch();
   for (let i = branch.length - 1; i >= 0; i--) if (humanReference(ctx, branch[i].id)) return branch[i].id;
   return undefined;
+}
+/** A goal may be given as a JSON file path; it must be a .json file inside the session directory. */
+export function loadGoalFile(ctx: any, path: string): unknown {
+  const base = ctx.cwd;
+  if (typeof base !== 'string' || !base) throw new Error('goal as a file path needs a known session directory; pass the goal object instead');
+  if (!isAbsolute(path) || !path.endsWith('.json')) throw new Error('goal file path must be an absolute path to a .json file');
+  let real: string, root: string;
+  try { real = realpathSync(resolve(path)); root = realpathSync(base); } catch { throw new Error(`goal file not found: ${path}`); }
+  const rel = relative(root, real);
+  if (rel.startsWith('..') || isAbsolute(rel)) throw new Error('goal file must be inside the session directory');
+  if (statSync(real).size > 256 * 1024) throw new Error('goal file is too large');
+  try { return JSON.parse(readFileSync(real, 'utf8')); } catch { throw new Error('goal file is not valid JSON'); }
 }
 export function registerPhaseDelegation(pi: ExtensionAPI, running: () => any[], env = process.env) {
  if (env.PI_SUBAGENT_NAME || env.PI_PHASE_WORKER === '1') return;
@@ -53,7 +66,7 @@ export function registerPhaseDelegation(pi: ExtensionAPI, running: () => any[], 
  });
  pi.registerTool({
   name: 'phase_control', label: 'Phase Control',
-  description: 'Manage a single approved phased goal: approve, prepare, review, checkpoint, answer, release, reconcile, cancel, status. Every result lists allowedNextActions (and a note); follow it instead of guessing the order. Use real human message/questionnaire entry IDs for approvals; `status` returns humanReferenceCandidate, the latest such entry on this branch (cite it only if that message is the approval). It does not spawn models or prove correctness.',
+  description: 'Manage a single approved phased goal: approve, prepare, review, checkpoint, answer, release, reconcile, cancel, status. approve takes the goal as an object or as an absolute path to a .json file inside the session directory. Every result lists allowedNextActions (and a note); follow it instead of guessing the order. Use real human message/questionnaire entry IDs for approvals; `status` returns humanReferenceCandidate, the latest such entry on this branch (cite it only if that message is the approval). It does not spawn models or prove correctness.',
   parameters: Type.Object({
    action: Type.Union(['approve','prepare','review','checkpoint','answer','release','reconcile','cancel','status'].map(v => Type.Literal(v))),
    goal: Type.Optional(Type.Any()), approvalReference: Type.Optional(Type.String()),
@@ -78,7 +91,7 @@ export function registerPhaseDelegation(pi: ExtensionAPI, running: () => any[], 
     requireHuman();
     if (running().some(r => r.phaseContract) || (state && !['cancelled','accepted'].includes(state.status))) throw new Error('Existing goal/worker must finish or be reconciled first');
     if (state?.status === 'accepted' && state.next < state.goal.phases.length) throw new Error('Existing approved goal still has phases');
-    state = approveGoal(params.goal, params.approvalReference); save(); return result();
+    state = approveGoal(typeof params.goal === 'string' ? loadGoalFile(ctx, params.goal) as any : params.goal, params.approvalReference); save(); return result();
    }
    if (!state) throw new Error('No approved phase goal');
    if (params.action === 'prepare') {

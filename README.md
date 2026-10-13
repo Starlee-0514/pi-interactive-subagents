@@ -269,6 +269,73 @@ This always forks the current session into a subagent with full conversation con
 
 ---
 
+## Phase-worker workflow (this fork)
+
+An opt-in, human-gated way to hand **one bounded implementation phase at a time** to a child agent. It never starts on its own: a model (or you) must call `phase_control`, and every phase is reviewed by the parent before the next one can start.
+
+### When subagents are dispatched
+
+Nothing is dispatched automatically. A subagent starts only when a model calls the `subagent` tool (directly, or because you ran `/subagent`, `/plan` or `/iterate`). For `phase-worker` there are extra gates:
+
+- the goal must be approved with a real human message first (`phase_control approve`), then prepared (`prepare`);
+- one writable phase-worker at a time; other agents are blocked while a phase is unresolved;
+- with the parent's lazy mode **off** (recommended), a human `checkpoint` is required between phases;
+- a child's question (`caller_ping`) comes back to the parent, which answers with `answer` and a restricted `subagent_resume` that keeps the original model, thinking level and tools.
+
+Without `-e` / an installed package none of these tools exist.
+
+### Use
+
+```bash
+pi -e /path/to/pi-interactive-subagents      # or add the package to your pi settings
+```
+
+The parent needs a lazy-mode owner: an extension that answers the `ask-user-question:lazy-query` event (the ask_user_question extension used with this fork does). Without one, `prepare` and dispatch fail closed. In the session run `/lazy off`, then give a goal and approve it in a normal message. The goal is JSON, passed to `approve` as an object or as an absolute path to a `.json` file inside the session directory:
+
+```json
+{
+  "id": "my-goal",
+  "scope": "implementation-and-verification",
+  "objective": "What the whole goal achieves",
+  "phases": [
+    {
+      "id": "parser",
+      "objective": "Implement X with TDD",
+      "cwd": "/abs/project/dir",
+      "allowedPaths": ["src/x.ts", "test/x.test.ts"],
+      "acceptance": ["X returns Y for Z"],
+      "verifyCommands": ["node --test test/x.test.ts"],
+      "nonGoals": ["No new dependencies"]
+    }
+  ]
+}
+```
+
+The parent then runs: `status` → `approve` → `prepare` → `subagent` (agent `phase-worker`) → `review` → (`checkpoint`) → next phase. `allowedPaths` are relative paths (no `..`, wildcards or backslashes). Every `phase_control` result lists `allowedNextActions` and a `note`; errors end with the allowed actions, so a model never has to guess the order.
+
+| Action | What it does |
+| --- | --- |
+| `status` | Current state, `allowedNextActions`, and `humanReferenceCandidate` (latest genuine human entry on the branch). |
+| `approve` | Approve a goal. Needs `approvalReference`: an entry ID of a human message or a manual questionnaire answer. |
+| `prepare` | Snapshot the parent's model/thinking and build the contract for the next phase. |
+| `review` | Parent records its own independent verification (commands + exit codes + acceptance evidence). A child's report alone is not acceptance. |
+| `checkpoint` | Human go-ahead between phases when lazy is off. |
+| `answer` | Reply to a child's `caller_ping` inside the contract (`category: technical-within-contract`); other categories need a human reference. |
+| `release` / `reconcile` / `cancel` | Drop a prepared phase / recover a paused worker / stop the goal. |
+
+The dispatch gate replaces whatever `task` text the model sends with the approved contract, so a reworded contract cannot cause rejected retries or widen the scope.
+
+### Where workers run (Zellij)
+
+Workers share background tabs named `subagents-<n>`: tiled panes, 4 per tab by default (`PI_SUBAGENT_TAB_CAPACITY`, 1–12), a new tab only when full. Tabs and panes are created with `--no-focus`. When a worker finishes only its own pane is closed; a tab you are viewing, or that another client has focused, is left alone, and the tab closes only when no worker is left.
+
+### Limits
+
+- Shell allow-lists and write/edit path guards are not an OS sandbox.
+- A contract deadline is checked at start and on tool calls; it does not kill the process.
+- There is no hard token or cost cap. Token totals reported by session logs include cached reads and are not billing figures.
+- `npm test` runs offline suites; the real-Zellij fake-child lifecycle test runs with `PI_PHASE_ZELLIJ_TEST=1`.
+
 ## Custom Agents
 
 Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global):

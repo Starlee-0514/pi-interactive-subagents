@@ -16,13 +16,13 @@ const levels = new Set(['off','minimal','low','medium','high','xhigh','max']);
 const string = (v: unknown): v is string => typeof v === 'string' && v.trim().length > 0 && !v.includes('\0');
 export function validatePhaseSpec(value: unknown): asserts value is PhaseSpec {
  const c = value as PhaseSpec;
- if (!c || !string(c.objective) || !string(c.cwd) || !isAbsolute(c.cwd)) throw new Error('Invalid phase contract objective/cwd');
+ if (!c || !string(c.objective) || !string(c.cwd) || !isAbsolute(c.cwd)) throw new Error('Invalid phase contract objective/cwd: objective and an absolute cwd are required strings');
  for (const key of ['allowedPaths','acceptance','verifyCommands'] as const) {
-  if (!Array.isArray(c[key]) || !c[key].length || !c[key].every(string)) throw new Error(`Invalid phase contract ${key}`);
+  if (!Array.isArray(c[key]) || !c[key].length || !c[key].every(string)) throw new Error(`Invalid phase contract ${key}: expected a non-empty array of strings`);
  }
- if (!Array.isArray(c.nonGoals) || !c.nonGoals.every(string)) throw new Error('Invalid phase contract nonGoals');
+ if (!Array.isArray(c.nonGoals) || !c.nonGoals.every(string)) throw new Error('Invalid phase contract nonGoals: expected an array of strings (use [] for none)');
  for (const path of c.allowedPaths) {
-  if (isAbsolute(path) || path.includes('\\') || path.split('/').includes('..') || path === '.' || path === './' || path.includes('*')) throw new Error('Invalid phase allowed path');
+  if (isAbsolute(path) || path.includes('\\') || path.split('/').includes('..') || path === '.' || path === './' || path.includes('*')) throw new Error('Invalid phase allowed path: use relative paths without .., backslashes or wildcards');
  }
 }
 export function parsePhaseContract(task: string): PhaseContract {
