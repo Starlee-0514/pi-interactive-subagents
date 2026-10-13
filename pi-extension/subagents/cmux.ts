@@ -1,5 +1,6 @@
 import { execSync, execFile, execFileSync, spawnSync } from "node:child_process";
 import { promisify } from "node:util";
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -148,14 +149,20 @@ function tailLines(text: string, lines: number): string {
   return split.slice(-lines).join("\n");
 }
 
+export function zellijTerminalSurface(surface: string): string {
+  const match = /^(?:pane:|terminal_)?(\d+)$/.exec(surface);
+  if (!match) throw new Error(`Invalid Zellij terminal surface: ${surface}`);
+  return `terminal_${match[1]}`;
+}
+
 function zellijPaneId(surface: string): string {
-  return surface.startsWith("pane:") ? surface.slice("pane:".length) : surface;
+  return zellijTerminalSurface(surface);
 }
 
 function zellijEnv(surface?: string): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (surface) {
-    env.ZELLIJ_PANE_ID = zellijPaneId(surface);
+    env.ZELLIJ_PANE_ID = zellijTerminalSurface(surface).slice('terminal_'.length);
   }
   return env;
 }
@@ -188,6 +195,7 @@ function zellijActionSync(args: string[], surface?: string): string {
   return execFileSync("zellij", zellijActionArgs(args, surface), {
     encoding: "utf8",
     env: zellijEnv(surface),
+    timeout: 10000,
   });
 }
 
@@ -195,6 +203,7 @@ async function zellijActionAsync(args: string[], surface?: string): Promise<stri
   const { stdout } = await execFileAsync("zellij", zellijActionArgs(args, surface), {
     encoding: "utf8",
     env: zellijEnv(surface),
+    timeout: 10000,
   });
   return stdout;
 }
@@ -391,22 +400,110 @@ function readZellijPanes(): ZellijPaneSnapshot[] {
   throw lastError;
 }
 
-function createZellijTiledPane(name: string, tabId: number): string {
-  const args = ["new-pane", "--tab-id", String(tabId), "--name", name, "--cwd", process.cwd()];
-  return parseZellijPaneSurface(zellijActionSync(args).trim(), "new-pane");
+export function buildZellijBackgroundPaneArgs(name: string, tabId: number, cwd: string, anchor?: string, command?: string[]): string[] {
+  if (!Number.isInteger(tabId) || tabId < 0) throw new Error('Cannot identify parent tab');
+  const args = ['new-pane', '--tab-id', String(tabId), '--no-focus', '--name', name, '--cwd', cwd];
+  if (anchor) { zellijTerminalSurface(anchor); args.push('--stacked'); }
+  if (command?.length) args.push('--', ...command);
+  return args;
 }
 
-function createZellijStackedPane(name: string, anchorSurface: string): string {
-  const args = [
-    "new-pane",
-    "--stacked",
-    "--near-current-pane",
-    "--name",
-    name,
-    "--cwd",
-    process.cwd(),
-  ];
-  return parseZellijPaneSurface(zellijActionSync(args, anchorSurface).trim(), "new-pane --stacked");
+type ZellijActionRunner = (args: string[]) => string;
+interface ZellijSharedTab { tabId: number; tabName: string; anchorIds: number[]; members: Set<number> }
+const zellijSharedTabs: ZellijSharedTab[] = [];
+const zellijWorkerTabs = new Map<string, ZellijSharedTab>();
+let zellijSharedTabSeq = 0;
+const workerTabKey = (surface: string) => `${process.env.ZELLIJ_SESSION_NAME ?? ''}:${surface}`;
+const sharedTabCapacity = () => {
+  const n = Number(process.env.PI_SUBAGENT_TAB_CAPACITY);
+  return Number.isInteger(n) && n >= 1 && n <= 12 ? n : 4;
+};
+
+/**
+ * Start a managed worker in a background tab that this process owns. Workers fill
+ * one shared tab (tiled panes) up to `capacity`; only then a new tab is created.
+ * Nothing here changes focus.
+ */
+export function createZellijWorkerTab(name: string, cwd: string, command: string[], run: ZellijActionRunner = args => zellijActionSync(args), capacity = sharedTabCapacity()): string {
+  if (!command.length || command.some(arg => typeof arg !== 'string' || arg.includes('\0'))) throw new Error('Managed tab requires an explicit command');
+  const liveTabs: any[] = JSON.parse(run(['list-tabs', '--json', '--state']));
+  for (let i = zellijSharedTabs.length - 1; i >= 0; i--) {
+    const t = zellijSharedTabs[i];
+    if (!liveTabs.some(x => x.tab_id === t.tabId && x.name === t.tabName)) zellijSharedTabs.splice(i, 1); // closed or renamed elsewhere: stop managing
+  }
+  let tab = zellijSharedTabs.find(t => t.members.size < capacity);
+  if (!tab) {
+    const tabName = `subagents-${++zellijSharedTabSeq}`;
+    // Separate tab creation from child launch: detached new-tab initial commands
+    // can run without becoming managed panes. Never retry-launch that command.
+    const raw = run(['new-tab', '--no-focus', '--name', tabName, '--cwd', cwd]).trim();
+    if (!/^\d+$/.test(raw)) throw new Error(`Invalid background tab ID: ${raw}`);
+    const tabId = Number(raw);
+    if (!Number.isSafeInteger(tabId)) throw new Error('Invalid background tab ID');
+    const initial = JSON.parse(run(['list-panes', '--json', '--state', '--tab'])).filter((p: any) => !p.is_plugin && p.tab_id === tabId);
+    if (initial.some((p: any) => !Number.isInteger(p.id))) throw new Error(`Ambiguous terminals in owned background tab ${tabId}`);
+    tab = { tabId, tabName, anchorIds: initial.map((p: any) => p.id), members: new Set() };
+    zellijSharedTabs.push(tab);
+  }
+  const tabId = tab.tabId;
+  const childRaw = run(buildZellijBackgroundPaneArgs(name, tabId, cwd, undefined, command)).trim();
+  const childId = /^terminal_(\d+)$/.exec(childRaw);
+  if (!childId) throw new Error(`Invalid child terminal ID in owned background tab ${tabId}: ${childRaw}`);
+  const terminalId = Number(childId[1]);
+  const surface = `pane:${terminalId}`;
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const panes = JSON.parse(run(['list-panes', '--json', '--state', '--tab']));
+    const terminals = panes.filter((p: any) => !p.is_plugin && p.tab_id === tabId && p.id === terminalId);
+    if (terminals.length > 1) throw new Error(`Ambiguous child terminal in owned background tab ${tabId}; retain for reconciliation`);
+    if (terminals.length === 1) {
+      tab.members.add(terminalId);
+      zellijWorkerTabs.set(workerTabKey(surface), tab);
+      return surface;
+    }
+    sleepSync(50);
+  }
+  throw new Error(`No terminal found in owned background tab ${tabId}; retain for reconciliation`);
+}
+
+/**
+ * Close the finished worker's own pane. A tab that is being viewed is left alone, and
+ * the tab itself closes only when no worker remains and nothing but its own anchor is left.
+ */
+export function closeZellijWorkerTab(surface: string, run: ZellijActionRunner = args => zellijActionSync(args)): boolean {
+  const key = workerTabKey(surface);
+  const owned = zellijWorkerTabs.get(key);
+  if (!owned) return false;
+  const terminalId = Number(/^(?:pane:|terminal_)(\d+)$/.exec(surface)?.[1]);
+  if (!owned.members.has(terminalId)) return false;
+  const tabs = JSON.parse(run(['list-tabs', '--json', '--state']));
+  const tab = tabs.find((t: any) => t.tab_id === owned.tabId);
+  if (!tab || tab.name !== owned.tabName || tab.active !== false || !Array.isArray(tab.other_focused_clients) || tab.other_focused_clients.length) return false;
+  const before = JSON.parse(run(['list-panes', '--json', '--state', '--tab'])).filter((p: any) => !p.is_plugin && p.tab_id === owned.tabId);
+  if (before.filter((p: any) => p.id === terminalId).length !== 1) return false;
+  run(['close-pane', '--pane-id', `terminal_${terminalId}`]);
+  owned.members.delete(terminalId);
+  zellijWorkerTabs.delete(key);
+  const remaining = before.filter((p: any) => p.id !== terminalId);
+  if (owned.members.size === 0 && remaining.every((p: any) => owned.anchorIds.includes(p.id))) {
+    run(['close-tab', '--tab-id', String(owned.tabId)]);
+    const idx = zellijSharedTabs.indexOf(owned);
+    if (idx >= 0) zellijSharedTabs.splice(idx, 1);
+  }
+  return true;
+}
+
+export function resolveZellijParentTab(panes: ZellijPaneSnapshot[], parentPaneId: number): number {
+  const parents = panes.filter(p => !p.is_plugin && p.id === parentPaneId);
+  if (parents.length !== 1 || !Number.isInteger(parents[0].tab_id)) throw new Error('Cannot uniquely identify parent terminal tab');
+  return parents[0].tab_id!;
+}
+
+function createZellijTiledPane(name: string, tabId: number, command?: string[]): string {
+  return parseZellijPaneSurface(zellijActionSync(buildZellijBackgroundPaneArgs(name, tabId, process.cwd(), undefined, command)).trim(), 'new-pane');
+}
+
+function createZellijStackedPane(name: string, anchorSurface: string, tabId: number, command?: string[]): string {
+  return parseZellijPaneSurface(zellijActionSync(buildZellijBackgroundPaneArgs(name, tabId, process.cwd(), anchorSurface, command), anchorSurface).trim(), 'new-pane --stacked');
 }
 
 function createZellijTab(name: string): string {
@@ -496,7 +593,7 @@ function withZellijSurfaceLock<T>(callback: () => T): T {
   }
 }
 
-function createZellijSurfaceUnlocked(name: string): string {
+function createZellijSurfaceUnlocked(name: string, command?: string[]): string {
   const parentPaneIdRaw = process.env.ZELLIJ_PANE_ID;
   const parentPaneId = parentPaneIdRaw ? Number(parentPaneIdRaw) : NaN;
   const minColumns = envPositiveInteger(
@@ -508,23 +605,17 @@ function createZellijSurfaceUnlocked(name: string): string {
     DEFAULT_ZELLIJ_SUBAGENT_MIN_ROWS,
   );
 
-  const plan = Number.isInteger(parentPaneId)
-    ? selectZellijPlacement(readZellijPanes(), parentPaneId, minColumns, minRows)
-    : null;
-
-  if (plan?.mode === "split") {
-    return createZellijTiledPane(name, plan.tabId);
-  }
-
-  if (plan?.mode === "stack") {
-    return createZellijStackedPane(name, `pane:${plan.targetPaneId}`);
-  }
-
-  return createZellijTab(name);
+  if (!Number.isInteger(parentPaneId)) throw new Error('ZELLIJ_PANE_ID is missing; refusing focus-changing fallback');
+  const panes = readZellijPanes();
+  resolveZellijParentTab(panes, parentPaneId);
+  const plan = selectZellijPlacement(panes, parentPaneId, minColumns, minRows);
+  if (plan?.mode === 'split') return createZellijTiledPane(name, plan.tabId, command);
+  if (plan?.mode === 'stack') return createZellijStackedPane(name, `pane:${plan.targetPaneId}`, plan.tabId, command);
+  throw new Error('Insufficient space in parent tab; refusing automatic new-tab/focus change');
 }
 
-function createZellijSurface(name: string): string {
-  return withZellijSurfaceLock(() => createZellijSurfaceUnlocked(name));
+function createZellijSurface(name: string, command?: string[]): string {
+  return withZellijSurfaceLock(() => createZellijSurfaceUnlocked(name, command));
 }
 
 type CmuxFocusSnapshot = {
@@ -751,7 +842,7 @@ function createCmuxSplitSurface(
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm).
  */
-export function createSurface(name: string): string {
+export function createSurface(name: string, options?: { command?: string[]; dedicatedTab?: boolean; cwd?: string }): string {
   const backend = getMuxBackend();
 
   if (backend === "cmux" && cmuxSubagentPane) {
@@ -773,7 +864,8 @@ export function createSurface(name: string): string {
   }
 
   if (backend === "zellij") {
-    return createZellijSurface(name);
+    if (options?.dedicatedTab) return createZellijWorkerTab(name, options.cwd ?? process.cwd(), options.command ?? []);
+    return createZellijSurface(name, options?.command);
   }
 
   // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
@@ -1077,7 +1169,7 @@ export function sendEscape(surface: string): void {
 export function sendLongCommand(
   surface: string,
   command: string,
-  options?: { scriptPath?: string; scriptPreamble?: string },
+  options?: { scriptPath?: string; scriptPreamble?: string; writeOnly?: boolean },
 ): string {
   const scriptPath =
     options?.scriptPath ??
@@ -1097,7 +1189,7 @@ export function sendLongCommand(
   writeFileSync(scriptPath, scriptParts.join("\n") + "\n", {
     mode: 0o755,
   });
-  sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
+  if (!options?.writeOnly) sendCommand(surface, `bash ${shellEscape(scriptPath)}`);
   return scriptPath;
 }
 
@@ -1212,6 +1304,10 @@ export function closeSurface(surface: string): void {
     return;
   }
 
+  if (zellijWorkerTabs.has(workerTabKey(surface))) {
+    closeZellijWorkerTab(surface); // Keep tabs that are being viewed or contain other terminals.
+    return;
+  }
   zellijActionSync(["close-pane"], surface);
 }
 
