@@ -207,3 +207,16 @@ test('a malformed phase names the phase and the field to fix', async () => {
  const f = fixture(); const bad: any = { id:'goal', scope:'implementation-and-verification', objective:'x', phases:[{ id:'p1', objective:'parser', cwd:'/repo', allowedPaths:['src/'], acceptance:['a'], verifyCommands:['v'] }] };
  await assert.rejects(() => f.run({ action:'approve', approvalReference:'user-approval', goal: bad }), /phase "p1".*nonGoals.*array of strings/i);
 });
+
+test('a malformed goal says exactly what is missing', async () => {
+ const f = fixture();
+ await assert.rejects(() => f.run({ action:'approve', approvalReference:'user-approval', goal:{ title:'rename message' } }), (e: any) => /scope/.test(e.message) && /objective/.test(e.message) && /phases/.test(e.message) && /implementation-and-verification/.test(e.message));
+ await assert.rejects(() => f.run({ action:'approve', approvalReference:'user-approval' }), /goal is required/);
+});
+
+test('phase_control guidance tells models not to delegate small edits', () => {
+ const f = fixture();
+ const text = (f.tools.get('phase_control').promptGuidelines ?? []).join(' ');
+ assert.match(text, /do not use/i);
+ assert.match(text, /small|single|one or two files/i);
+});

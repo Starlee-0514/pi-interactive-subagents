@@ -67,6 +67,11 @@ export function registerPhaseDelegation(pi: ExtensionAPI, running: () => any[], 
  pi.registerTool({
   name: 'phase_control', label: 'Phase Control',
   description: 'Manage a single approved phased goal: approve, prepare, review, checkpoint, answer, release, reconcile, cancel, status. approve takes the goal as an object or as an absolute path to a .json file inside the session directory. Every result lists allowedNextActions (and a note); follow it instead of guessing the order. Use real human message/questionnaire entry IDs for approvals; `status` returns humanReferenceCandidate, the latest such entry on this branch (cite it only if that message is the approval). It does not spawn models or prove correctness.',
+  promptGuidelines: [
+   'phase_control hands bounded implementation PHASES to a child agent. Do not use it for a small edit (one or two files, a few lines), a quick fix, a question or a design discussion: do those yourself.',
+   'Use phase_control only when the user wants a feature built that spans several files or phases with independent checks, or explicitly asks for a subagent or phase-worker, and has approved the goal.',
+   'Before first use read the phase-worker-dispatch skill. Follow allowedNextActions in every result; never invent an approvalReference.',
+  ],
   parameters: Type.Object({
    action: Type.Union(['approve','prepare','review','checkpoint','answer','release','reconcile','cancel','status'].map(v => Type.Literal(v))),
    goal: Type.Optional(Type.Any()), approvalReference: Type.Optional(Type.String()),

@@ -8,7 +8,14 @@ export interface PhaseState {
  checkpoint?: number; usedAttempts: string[];
 }
 export function approveGoal(goal: PhaseGoal, authorizationReference: string): PhaseState {
- if (!goal || goal.scope !== 'implementation-and-verification' || !goal.id?.trim() || !goal.objective?.trim() || !authorizationReference?.trim() || !Array.isArray(goal.phases) || !goal.phases.length) throw new Error('Explicit implementation-and-verification goal approval required');
+ const missing: string[] = [];
+ if (!goal || typeof goal !== 'object') throw new Error('Explicit implementation-and-verification goal approval required: goal is required (an object, or an absolute path to a .json file)');
+ if (goal.scope !== 'implementation-and-verification') missing.push('scope must be exactly "implementation-and-verification"');
+ if (!goal.id?.trim()) missing.push('id (non-empty string)');
+ if (!goal.objective?.trim()) missing.push('objective (non-empty string)');
+ if (!Array.isArray(goal.phases) || !goal.phases.length) missing.push('phases (non-empty array of {id, objective, cwd, allowedPaths, acceptance, verifyCommands, nonGoals})');
+ if (!authorizationReference?.trim()) missing.push('authorizationReference');
+ if (missing.length) throw new Error(`Explicit implementation-and-verification goal approval required: ${missing.join('; ')}`);
  const ids = new Set<string>();
  for (const p of goal.phases) {
   if (!p?.id?.trim() || ids.has(p.id)) throw new Error('Unique phase IDs required');
