@@ -81,11 +81,13 @@ Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch 
 
 | Agent             | Model                  | Role                                                                                     |
 | ----------------- | ---------------------- | ---------------------------------------------------------------------------------------- |
-| **planner**       | Opus (medium thinking) | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
-| **scout**         | Haiku                  | Fast codebase reconnaissance — maps files, patterns, conventions                         |
-| **worker**        | Sonnet                 | Implements tasks from todos — writes code, runs tests, makes polished commits            |
-| **reviewer**      | Opus (medium thinking) | Reviews code for bugs, security issues, correctness                                      |
-| **visual-tester** | Sonnet                 | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+| **planner**       | GPT-6 Astra (medium)   | Brainstorming — clarifies requirements, explores approaches, writes plans, creates todos |
+| **scout**         | GPT-6 Luna (low)       | Fast codebase reconnaissance — maps files, patterns, conventions                         |
+| **worker**        | GPT-6 Sol (medium)     | Implements tasks from todos — writes code, runs tests, makes polished commits            |
+| **reviewer**      | GPT-6 Astra (medium)   | Reviews code for bugs, security issues, correctness                                      |
+| **visual-tester** | GPT-6 Sol (medium)     | Visual QA via Chrome CDP — screenshots, responsive testing, interaction testing          |
+
+This fork maps the bundled agents onto the OpenAI Codex models (`openai-codex/gpt-6-*`): the strongest tier (Astra) for planning and review, the balanced tier (Sol) for implementation and visual QA, the cheap fast tier (Luna) for read-only recon. The `phase-worker` agent has no model of its own: it always uses the parent session's model and thinking level. `claude-code` still runs the Claude Code CLI.
 
 Agent discovery follows priority: **project-local** (`.pi/agents/`) > **global** (`~/.pi/agent/agents/`) > **package-bundled**. Override any bundled agent by placing your own version in the higher-priority location.
 
